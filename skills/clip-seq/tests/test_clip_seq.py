@@ -209,9 +209,142 @@ def test_missing_output_exits_nonzero():
 
 
 # ---------------------------------------------------------------------------
-# Full pipeline — add tests as each step is implemented
+# --run mode: build_pipeline_params
+# ---------------------------------------------------------------------------
+
+def test_build_pipeline_params_from_suggestions():
+    """build_pipeline_params must convert suggestions to a flat string dict."""
+    mod = _load_module()
+    suggestions = {
+        "crosslink_position": {"value": "start", "confidence": "high"},
+        "encode_eclip":       {"value": False,   "confidence": "high"},
+        "skip_umi_dedupe":    {"value": False,   "confidence": "high"},
+        "umi_separator":      {"value": "_",     "confidence": "high"},
+        "genome":             {"value": "GRCh38","confidence": "high"},
+    }
+    params = mod.build_pipeline_params(suggestions)
+    assert params["crosslink_position"] == "start"
+    assert params["encode_eclip"] == "false"
+    assert params["skip_umi_dedupe"] == "false"
+    assert params["umi_separator"] == "_"
+
+
+def test_build_pipeline_params_excludes_genome():
+    """genome is passed as a fileset ID separately — must not appear in params."""
+    mod = _load_module()
+    suggestions = {
+        "crosslink_position": {"value": "start", "confidence": "high"},
+        "genome":             {"value": "GRCh38","confidence": "high"},
+    }
+    params = mod.build_pipeline_params(suggestions)
+    assert "genome" not in params
+
+
+def test_build_pipeline_params_excludes_none_values():
+    """Parameters with None values (unset optional params) must be omitted."""
+    mod = _load_module()
+    suggestions = {
+        "crosslink_position": {"value": "start", "confidence": "high"},
+        "paraclu_min_value":  {"value": None,    "confidence": "low"},
+    }
+    params = mod.build_pipeline_params(suggestions)
+    assert "paraclu_min_value" not in params
+
+
+def test_build_pipeline_params_override_takes_precedence():
+    """Explicit overrides must replace the suggested value."""
+    mod = _load_module()
+    suggestions = {
+        "crosslink_position": {"value": "start", "confidence": "high"},
+        "encode_eclip":       {"value": False,   "confidence": "high"},
+    }
+    params = mod.build_pipeline_params(suggestions, override={"crosslink_position": "end"})
+    assert params["crosslink_position"] == "end"
+    assert params["encode_eclip"] == "false"
+
+
+def test_build_pipeline_params_override_bool_coercion():
+    """Boolean overrides must be coerced to 'true'/'false' strings."""
+    mod = _load_module()
+    params = mod.build_pipeline_params({}, override={"encode_eclip": True})
+    assert params["encode_eclip"] == "true"
+
+
+# ---------------------------------------------------------------------------
+# --run dry-run mode (CLI)
+# ---------------------------------------------------------------------------
+
+def test_dry_run_exits_zero(tmp_path):
+    """--run --dry-run with a sample and genome ID must exit 0."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--run", "--sample", "fake_sample_id", "--genome", "fake_genome_id",
+         "--dry-run", "--output", str(tmp_path)],
+        capture_output=True, text=True,
+        env={**__import__("os").environ,
+             "FLOW_USERNAME": "testuser", "FLOW_PASSWORD": "testpass"},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_dry_run_creates_report(tmp_path):
+    """--run --dry-run must write report.md and result.json."""
+    subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--run", "--sample", "fake_sample_id", "--genome", "fake_genome_id",
+         "--dry-run", "--output", str(tmp_path)],
+        capture_output=True,
+        env={**__import__("os").environ,
+             "FLOW_USERNAME": "testuser", "FLOW_PASSWORD": "testpass"},
+    )
+    assert (tmp_path / "report.md").exists()
+    assert (tmp_path / "result.json").exists()
+
+
+def test_dry_run_report_shows_params(tmp_path):
+    """Dry-run report must show the params that would be submitted."""
+    subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--run", "--sample", "fake_sample_id", "--genome", "fake_genome_id",
+         "--dry-run", "--output", str(tmp_path)],
+        capture_output=True,
+        env={**__import__("os").environ,
+             "FLOW_USERNAME": "testuser", "FLOW_PASSWORD": "testpass"},
+    )
+    text = (tmp_path / "report.md").read_text()
+    assert "crosslink_position" in text
+    assert "DRY RUN" in text.upper() or "dry run" in text.lower()
+
+
+def test_dry_run_result_json_has_pipeline_params(tmp_path):
+    """result.json must contain a 'pipeline_params' key ready for submission."""
+    subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--run", "--sample", "fake_sample_id", "--genome", "fake_genome_id",
+         "--dry-run", "--output", str(tmp_path)],
+        capture_output=True,
+        env={**__import__("os").environ,
+             "FLOW_USERNAME": "testuser", "FLOW_PASSWORD": "testpass"},
+    )
+    data = json.loads((tmp_path / "result.json").read_text())
+    assert "pipeline_params" in data
+    assert isinstance(data["pipeline_params"], dict)
+
+
+def test_run_requires_sample_and_genome(tmp_path):
+    """--run without --sample or --genome must exit non-zero."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--run", "--output", str(tmp_path)],
+        capture_output=True, text=True,
+        env={**__import__("os").environ,
+             "FLOW_USERNAME": "testuser", "FLOW_PASSWORD": "testpass"},
+    )
+    assert result.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# Live pipeline — add tests as each step is implemented
 # ---------------------------------------------------------------------------
 
 # TODO: test --history mode authenticates and fetches real executions
-# TODO: test param extraction from a live execution
-# TODO: test report reflects actual execution count
+# TODO: test --run (non dry-run) actually calls FlowClient.run_pipeline

@@ -16,8 +16,9 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 CLIP_PIPELINE_ID = "960154035051242353"
+CLIP_PIPELINE_VERSION_ID = "337265464908053502"  # v1.7 (latest)
 CLIP_PIPELINE_NAME = "CLIP-Seq"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 DISCLAIMER = (
     "ClawBio is a research and educational tool. It is not a medical device "
@@ -479,6 +480,236 @@ def run_history(
 
 
 # ---------------------------------------------------------------------------
+# --run mode helpers
+# ---------------------------------------------------------------------------
+
+
+def build_pipeline_params(
+    suggestions: dict[str, dict],
+    override: dict | None = None,
+) -> dict[str, str]:
+    """Convert suggestion dict to flat string params ready for flow.bio API.
+
+    - Skips 'genome' (passed as fileset ID separately).
+    - Skips params not in PARAM_SCHEMA (e.g. internal keys).
+    - Skips None values (unset optional params).
+    - Coerces booleans to 'true'/'false' strings.
+    - Override values take precedence over suggestions.
+    """
+    params: dict[str, str] = {}
+
+    for param, s in suggestions.items():
+        if param == "genome" or param not in PARAM_SCHEMA:
+            continue
+        val = s["value"]
+        if val is None:
+            continue
+        params[param] = "true" if val is True else ("false" if val is False else str(val))
+
+    if override:
+        for k, v in override.items():
+            if v is None:
+                continue
+            params[k] = "true" if v is True else ("false" if v is False else str(v))
+
+    return params
+
+
+def run_pipeline_with_suggestions(
+    username: str,
+    password: str,
+    sample_id: str,
+    genome_id: str,
+    output_dir: Path,
+    pipeline_version_id: str = CLIP_PIPELINE_VERSION_ID,
+    n_history: int = 50,
+    override_params: dict | None = None,
+    dry_run: bool = False,
+) -> None:
+    """Mine execution history, build params, and launch (or preview) the pipeline.
+
+    In dry-run mode: shows what would be submitted, writes report + result.json,
+    exits without calling the flow.bio run endpoint.
+    Falls back to demo suggestions if authentication fails (useful for dry-run testing).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "reproducibility").mkdir(exist_ok=True)
+
+    # --- Fetch history for suggestions ---
+    executions: list[dict] = []
+    suggestions: dict[str, dict] = {}
+    history_source = "demo fallback"
+
+    try:
+        sys.path.insert(0, str(SKILL_DIR.parent / "flow-bio"))
+        from flow_bio import FlowClient
+
+        client = FlowClient()
+        resp = client.login(username, password)
+        user = resp.get("user", {}).get("username", username)
+        print(f"Authenticated as: {user}")
+
+        owned = client.get_executions_owned()
+        clip_owned = [e for e in owned if CLIP_PIPELINE_NAME in e.get("pipeline_name", "")]
+
+        executions = list(clip_owned)
+        if len(executions) < n_history:
+            try:
+                pub = client._get("/executions/search", params={"pipeline_name": CLIP_PIPELINE_NAME})
+                for e in (pub.get("executions", []) if isinstance(pub, dict) else [])[:n_history - len(executions)]:
+                    try:
+                        executions.append(client.get_execution(e["id"]))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Fetch params for owned summary-only records
+        detailed: list[dict] = []
+        for e in executions:
+            if e.get("params") is None:
+                try:
+                    detailed.append(client.get_execution(e["id"]))
+                except Exception:
+                    detailed.append(e)
+            else:
+                detailed.append(e)
+
+        executions = detailed
+        history_source = f"flow.bio ({len(executions)} executions)"
+
+    except Exception as exc:
+        if not dry_run:
+            print(f"ERROR: authentication failed — {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Warning: could not authenticate ({exc}). Using demo suggestions for dry run.", file=sys.stderr)
+        executions = _make_demo_executions()
+        history_source = "demo data (auth unavailable)"
+
+    param_list = [extract_params(e) for e in executions]
+    stats = aggregate_params(param_list)
+    suggestions = suggest_params(stats)
+    pipeline_params = build_pipeline_params(suggestions, override=override_params)
+
+    # --- Report ---
+    mode_label = f"{'DRY RUN — ' if dry_run else ''}params from {history_source}"
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        "# ClawBio CLIP-seq — Pipeline Launch" + (" (DRY RUN)" if dry_run else ""),
+        "",
+        f"**Date**: {ts}",
+        f"**Sample ID**: `{sample_id}`",
+        f"**Genome fileset ID**: `{genome_id}`",
+        f"**Pipeline version**: `{pipeline_version_id}`",
+        f"**Mode**: {mode_label}",
+        "",
+    ]
+
+    if dry_run:
+        lines += [
+            "> **DRY RUN** — No pipeline was launched. "
+            "Remove `--dry-run` to submit.",
+            "",
+        ]
+
+    lines += [
+        "## Parameters to be submitted",
+        "",
+        "| Parameter | Value | Source |",
+        "|-----------|-------|--------|",
+    ]
+    for k, v in pipeline_params.items():
+        src = "override" if (override_params and k in override_params) else \
+              f"{suggestions.get(k, {}).get('confidence', '?')} confidence"
+        lines.append(f"| `{k}` | `{v}` | {src} |")
+
+    lines += [
+        "",
+        "## Suggested values (full detail)",
+        "",
+        "| Parameter | Value | Confidence | Agreement |",
+        "|-----------|-------|------------|-----------|",
+    ]
+    for param, s in suggestions.items():
+        if param == "genome" or param not in PARAM_SCHEMA:
+            continue
+        conf_emoji = {"high": "✅", "medium": "⚠️", "low": "❓"}.get(s["confidence"], "")
+        lines.append(
+            f"| `{param}` | `{s['value']}` | {conf_emoji} {s['confidence']} | {s['agreement_pct']}% |"
+        )
+
+    if not dry_run:
+        lines += ["", f"## Execution", "", f"**Execution ID**: see `result.json`"]
+
+    lines += [
+        "",
+        "## Reproduce",
+        "",
+        "```bash",
+        f"python skills/clip-seq/clip_seq.py \\",
+        f"  --run --sample {sample_id} --genome {genome_id} \\",
+        f"  --output {output_dir}",
+        "```",
+        "",
+        f"---",
+        f"*{DISCLAIMER}*",
+        "",
+    ]
+
+    (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # --- Launch or dry-run ---
+    execution_result: dict = {}
+    if not dry_run:
+        try:
+            from flow_bio import FlowClient as _FC
+            _client = _FC()
+            _client.login(username, password)
+            execution_result = _client.run_pipeline(
+                pipeline_version_id=pipeline_version_id,
+                sample_ids=[sample_id],
+                params=pipeline_params,
+                genome_id=genome_id,
+            )
+            exec_id = execution_result.get("id", "?")
+            print(f"\nPipeline launched! Execution ID: {exec_id}")
+            print(f"Monitor with: python skills/flow-bio/flow_bio.py --execution {exec_id}")
+        except Exception as exc:
+            print(f"ERROR: pipeline launch failed — {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    result = {
+        "skill": "clip-seq",
+        "version": VERSION,
+        "mode": "dry_run" if dry_run else "run",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sample_id": sample_id,
+        "genome_id": genome_id,
+        "pipeline_version_id": pipeline_version_id,
+        "pipeline_params": pipeline_params,
+        "suggestions": {k: {"value": v["value"], "confidence": v["confidence"]} for k, v in suggestions.items()},
+        "execution": execution_result,
+    }
+    (output_dir / "result.json").write_text(
+        json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+
+    cmd = (
+        f"FLOW_USERNAME='{username}' FLOW_PASSWORD='***' \\\n"
+        f"  python skills/clip-seq/clip_seq.py \\\n"
+        f"  --run --sample {sample_id} --genome {genome_id} \\\n"
+        f"  --output {output_dir}\n"
+    )
+    (output_dir / "reproducibility" / "commands.sh").write_text(
+        f"#!/usr/bin/env bash\n# {ts}\n\n{cmd}", encoding="utf-8"
+    )
+
+    if dry_run:
+        print(f"\nDry run complete. Review params in {output_dir}/report.md before launching.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -491,15 +722,27 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  python clip_seq.py --demo --output /tmp/clip_demo\n"
             "  python clip_seq.py --history --output /tmp/clip_history\n"
-            "  FLOW_USERNAME=me FLOW_PASSWORD=pw python clip_seq.py --history --output /tmp/out\n"
+            "  python clip_seq.py --run --sample <ID> --genome <ID> --dry-run --output /tmp/out\n"
+            "  python clip_seq.py --run --sample <ID> --genome <ID> --output /tmp/out\n"
         ),
     )
-    p.add_argument("--demo", action="store_true", help="Run with synthetic data (no credentials)")
-    p.add_argument("--history", action="store_true", help="Fetch real CLIP-Seq history from flow.bio")
+    p.add_argument("--demo",    action="store_true", help="Run with synthetic data (no credentials)")
+    p.add_argument("--history", action="store_true", help="Fetch CLIP-Seq history and show suggestions")
+    p.add_argument("--run",     action="store_true", help="Fetch history, build params, and launch pipeline")
+
     p.add_argument("--username", help="flow.bio username (or set FLOW_USERNAME)")
     p.add_argument("--password", help="flow.bio password (or set FLOW_PASSWORD)")
-    p.add_argument("--n", type=int, default=50, help="Max executions to analyse (default: 50)")
-    p.add_argument("--no-public", action="store_true", help="Only use owned executions, not public ones")
+    p.add_argument("--n",        type=int, default=50, help="Max executions to analyse (default: 50)")
+    p.add_argument("--no-public", action="store_true", help="Only use owned executions")
+
+    # --run specific
+    p.add_argument("--sample",   metavar="ID",   help="flow.bio sample ID to run the pipeline on")
+    p.add_argument("--genome",   metavar="ID",   help="flow.bio genome fileset ID")
+    p.add_argument("--override", metavar="JSON", help="JSON string of params that override suggestions")
+    p.add_argument("--dry-run",  action="store_true", help="Show params without launching the pipeline")
+    p.add_argument("--pipeline-version", default=CLIP_PIPELINE_VERSION_ID,
+                   help=f"Pipeline version ID (default: {CLIP_PIPELINE_VERSION_ID})")
+
     p.add_argument("--output", required=True, help="Output directory")
     return p.parse_args()
 
@@ -513,14 +756,15 @@ def main() -> None:
         run_demo(output_dir)
         return
 
+    username = args.username or os.environ.get("FLOW_USERNAME", "")
+    password = args.password or os.environ.get("FLOW_PASSWORD", "")
+
     if args.history:
-        username = args.username or os.environ.get("FLOW_USERNAME", "")
-        password = args.password or os.environ.get("FLOW_PASSWORD", "")
         if not username or not password:
             print(
                 "ERROR: --history requires flow.bio credentials.\n"
                 "Set FLOW_USERNAME + FLOW_PASSWORD, or use --username / --password.\n"
-                "Or try --demo to run without credentials.",
+                "Try --demo to run without credentials.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -533,7 +777,25 @@ def main() -> None:
         )
         return
 
-    print("ERROR: specify --demo or --history", file=sys.stderr)
+    if args.run:
+        if not args.sample or not args.genome:
+            print("ERROR: --run requires --sample <ID> and --genome <ID>", file=sys.stderr)
+            sys.exit(1)
+        override = json.loads(args.override) if args.override else None
+        run_pipeline_with_suggestions(
+            username=username,
+            password=password,
+            sample_id=args.sample,
+            genome_id=args.genome,
+            output_dir=output_dir,
+            pipeline_version_id=args.pipeline_version,
+            n_history=args.n,
+            override_params=override,
+            dry_run=args.dry_run,
+        )
+        return
+
+    print("ERROR: specify --demo, --history, or --run", file=sys.stderr)
     sys.exit(1)
 
 
