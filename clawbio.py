@@ -1187,7 +1187,7 @@ def main():
     run_parser.add_argument("--modality", default=None, help="Modality hint for bioc skill")
     run_parser.add_argument("--max-results", type=int, default=None, help="Maximum bioc search/recommendation results")
     # flow-bio skill flags
-    run_parser.add_argument("--search", default=None, help="Search query (galaxy/flow skills)")
+    # run_parser.add_argument("--search", default=None, help="Search query (galaxy/flow skills)")
     run_parser.add_argument("--pipelines", action="store_true", help="List pipelines (flow skill)")
     run_parser.add_argument("--samples", action="store_true", help="List samples (flow skill)")
     run_parser.add_argument("--projects", action="store_true", help="List projects (flow skill)")
