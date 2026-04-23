@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/ashcherbakova/Personal/ClawBio/**)",
+      "Bash(python -m pip install pytest -q)",
+      "Bash(python -m pytest skills/clip-seq/tests/ -v)"
+    ]
+  }
+}
